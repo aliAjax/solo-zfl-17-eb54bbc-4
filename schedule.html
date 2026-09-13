@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>胶片修复与试映排期台</title>
+    <link rel="stylesheet" href="schedule.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">纸质放映胶片整理 · 多卷协作</p>
+          <h1>胶片修复与试映排期台</h1>
+          <p class="subtitle">沿用「胶片分镜条核对台」的片段数据，安排清洗、接片、试映等多卷工序。</p>
+        </div>
+        <div class="hero-stats">
+          <div>
+            <span>胶片卷</span>
+            <strong id="statReels">0</strong>
+          </div>
+          <div>
+            <span>工序总数</span>
+            <strong id="statOps">0</strong>
+          </div>
+          <div>
+            <span>阻断问题</span>
+            <strong id="statErrors" class="stat-bad">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="toolbar">
+        <label class="tb-origin">
+          工坊开门时间
+          <input id="originInput" type="datetime-local" step="300" />
+        </label>
+        <button id="syncDeskBtn" title="从核对台 localStorage 读取片段库">⇲ 同步核对台片段</button>
+        <button id="autoScheduleBtn" class="primary">⚙ 自动排期</button>
+        <button id="undoBtn" disabled>↶ 撤销</button>
+        <span class="tb-spacer"></span>
+        <button id="lockBtn" class="lock">🔒 校验并锁定版本</button>
+        <button id="exportBtn">⤓ 导出排期</button>
+        <button id="importBtn">⤒ 导入排期</button>
+        <input id="importFile" type="file" accept="application/json,.json" hidden />
+      </section>
+
+      <div id="mergeBanner" class="merge-banner" hidden></div>
+      <div id="toast" class="toast" hidden></div>
+
+      <div class="board">
+        <aside class="side">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>人员与设备</h2>
+              <span>同一资源不可重叠</span>
+            </div>
+            <ul id="resourceList" class="resource-list"></ul>
+            <form id="resourceForm" class="inline-form">
+              <input id="resNameInput" placeholder="新增人员或设备名称" required />
+              <select id="resKindInput">
+                <option value="人员">人员</option>
+                <option value="设备">设备</option>
+              </select>
+              <button type="submit" title="新增资源">＋</button>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>片段库（来自核对台）</h2>
+              <span id="segmentCount">0 条</span>
+            </div>
+            <div id="segmentPool" class="segment-pool"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>已锁版本</h2>
+              <span>快照不可变</span>
+            </div>
+            <div id="versionList" class="version-list"></div>
+            <div id="liveDiff" class="live-diff"></div>
+          </section>
+        </aside>
+
+        <section class="main-col">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>多卷工作单</h2>
+              <button id="addReelBtn" class="small">＋ 新增胶片卷</button>
+            </div>
+            <div id="reelList" class="reel-list"></div>
+          </section>
+
+          <section class="panel gantt-panel">
+            <div class="panel-head">
+              <h2>排期时间线（按资源分行）</h2>
+              <span>虚线为各卷截止时间</span>
+            </div>
+            <div id="ganttScroll" class="gantt-scroll">
+              <div id="gantt"></div>
+            </div>
+            <div id="ganttLegend" class="legend"></div>
+          </section>
+
+          <section class="panel validation-panel">
+            <div class="panel-head">
+              <h2>提交前校验</h2>
+              <span id="validationSummary"></span>
+            </div>
+            <ul id="validationList" class="validation-list"></ul>
+          </section>
+        </section>
+      </div>
+    </main>
+
+    <dialog id="modal" class="modal">
+      <div class="modal-card">
+        <h3 id="modalTitle"></h3>
+        <div id="modalBody"></div>
+        <div class="modal-actions" id="modalActions"></div>
+      </div>
+    </dialog>
+
+    <script src="schedule.js"></script>
+  </body>
+</html>
