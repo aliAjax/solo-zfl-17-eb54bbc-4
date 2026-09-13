@@ -192,6 +192,11 @@ function fmtDur(min) {
   return `${Math.floor(v / 60)}小时${String(v % 60).padStart(2, "0")}分`;
 }
 
+/** 仅保留安全的文件名字符，版本标识再不可信也不能写出路径分隔或控制符。 */
+function safeFilePart(s) {
+  return String(s ?? "").replace(/[^0-9A-Za-z一-鿿._-]/g, "_").slice(0, 40) || "version";
+}
+
 function dtLocalValue(iso) {
   if (!iso) return "";
   const d = new Date(iso);
@@ -600,8 +605,11 @@ function validateImport(raw) {
     versions: []
   };
 
-  // 资源：重复 ID 检查
+  // 资源：重复 ID 检查 + 同名资源归并到同一标识
   const seenRes = new Set();
+  const nameToCanonical = new Map(); // 同名（区分大小写、去空格）→ 保留的首个 id
+  const resIdAlias = new Map();      // 被归并的旧 id → 规范 id
+  let sameNameMerged = 0;
   for (const r of src.resources) {
     if (!r || typeof r !== "object" || !r.id || !r.name) {
       errors.push({ message: "存在缺少 id/name 的资源记录。" });
@@ -611,8 +619,20 @@ function validateImport(raw) {
       errors.push({ message: `资源 ID 重复：${r.id}（${r.name || ""}）。` });
       continue;
     }
+    const nameKey = String(r.name).trim();
+    if (nameToCanonical.has(nameKey)) {
+      // 同名不同 id：统一到首个资源标识，引用稍后重映射，不允许留下未分配工序
+      resIdAlias.set(r.id, nameToCanonical.get(nameKey));
+      sameNameMerged++;
+      seenRes.add(r.id);
+      continue;
+    }
+    nameToCanonical.set(nameKey, r.id);
     seenRes.add(r.id);
-    normalized.resources.push({ id: r.id, name: String(r.name), kind: ["人员", "设备"].includes(r.kind) ? r.kind : "人员" });
+    normalized.resources.push({ id: r.id, name: nameKey, kind: ["人员", "设备"].includes(r.kind) ? r.kind : "人员" });
+  }
+  if (sameNameMerged) {
+    warnings.push({ message: `文件内 ${sameNameMerged} 个同名资源已统一到同一资源标识，相关工序不会变为未分配。` });
   }
 
   const reelIds = new Set();
@@ -656,8 +676,10 @@ function validateImport(raw) {
       if (!(Number(op.duration) > 0)) {
         errors.push({ message: `卷「${nr.name}」工序 ${op.id.slice(-6)} 时长非法（必须为正数）。` });
       }
-      if (op.resourceId && !seenRes.has(op.resourceId)) {
-        errors.push({ message: `卷「${nr.name} · ${op.kind || op.id.slice(-6)}」引用了不存在的资源 ${op.resourceId.slice(-6)}。` });
+      let opResId = op.resourceId || null;
+      if (opResId && resIdAlias.has(opResId)) opResId = resIdAlias.get(opResId);
+      if (opResId && !seenRes.has(opResId)) {
+        errors.push({ message: `卷「${nr.name} · ${op.kind || op.id.slice(-6)}」引用了不存在的资源 ${opResId.slice(-6)}。` });
       }
       if (op.start != null && Number.isNaN(new Date(op.start).getTime())) {
         errors.push({ message: `卷「${nr.name} · ${op.kind || op.id.slice(-6)}」开始时间非法：${String(op.start).slice(0, 32)}。` });
@@ -666,7 +688,7 @@ function validateImport(raw) {
         id: op.id,
         kind: OP_KINDS.includes(op.kind) ? op.kind : "其他",
         duration: Number(op.duration) || 0,
-        resourceId: op.resourceId || null,
+        resourceId: opResId,
         dependsOn: Array.isArray(op.dependsOn) ? op.dependsOn : [],
         start: op.start ?? null,
         note: String(op.note || "")
@@ -700,79 +722,109 @@ function validateImport(raw) {
   if (dupCount) warnings.push({ message: `检测到 ${dupCount} 个与当前排期重复的 ID，导入时将重新编号以避免覆盖。` });
 
   const versions = Array.isArray(src.lockedVersions ?? src.versions) ? (src.lockedVersions ?? src.versions) : [];
+  const seenVerIds = new Set(env.doc.versions.map((v) => v.id));
+  const existingLabels = new Set(env.doc.versions.map((v) => v.label));
+  const labelsInFile = new Set();
   for (const v of versions) {
-    if (v && v.id && v.label && Array.isArray(v.reels)) {
-      normalized.versions.push(v);
-    } else {
+    if (!v || !v.id || !v.label || !Array.isArray(v.reels)) {
       warnings.push({ message: "跳过了一个结构不完整的锁定版本。" });
+      continue;
     }
+    // 标识只作纯文本展示：拒绝控制字符与标签形态，长度受限
+    const rawLabel = String(v.label);
+    if (/[<>]|[\u0000-\u001F]|javascript:/i.test(rawLabel) || rawLabel.length > 40) {
+      errors.push({ message: `锁定版本标识「${rawLabel.slice(0, 20)}」含非法字符或过长，导入被阻止。` });
+      continue;
+    }
+    if (seenVerIds.has(v.id)) {
+      warnings.push({ message: `已存在相同的锁定版本（id ${v.id.slice(-6)}），跳过。` });
+      continue;
+    }
+    if (existingLabels.has(rawLabel) || labelsInFile.has(rawLabel)) {
+      // 版本号重复会破坏「v1/v2」语义与差异对照，必须拦截而不是静默覆盖
+      errors.push({ message: `锁定版本标识重复：${rawLabel}（与当前库或文件内另一版本相同）。` });
+      continue;
+    }
+    labelsInFile.add(rawLabel);
+    seenVerIds.add(v.id);
+    normalized.versions.push({
+      ...v,
+      label: rawLabel,
+      note: typeof v.note === "string" ? v.note.slice(0, 500) : "",
+      // 只保留白名单字段，防止版本内嵌异常结构
+      id: v.id,
+      lockedAt: v.lockedAt,
+      origin: v.origin,
+      resources: Array.isArray(v.resources) ? v.resources : [],
+      reels: v.reels,
+      revision: Number(v.revision) || 0
+    });
   }
+
+  // 结构与脏数据全部通过后，为所有来自文件的实体重签本应用生成的安全 id。
+  // 外部 id 是攻击者可控字符串，绝不允许原样进入 data-* 属性、选择器或代码。
+  if (!errors.length) reIdNormalized(normalized);
 
   return { valid: errors.length === 0, errors, warnings, normalized };
 }
 
-/** 执行导入：重签重复 ID、合入版本、整批可撤销 */
+/** 给导入文档重签安全 id，并重写所有内部引用（资源/依赖）。 */
+function reIdNormalized(n) {
+  const resMap = new Map(n.resources.map((r) => [r.id, uid("res")]));
+  n.resources.forEach((r) => { r.id = resMap.get(r.id); });
+
+  const opMap = new Map();
+  for (const reel of n.reels) {
+    reel.id = uid("reel");
+    for (const op of reel.ops) opMap.set(op.id, uid("op"));
+  }
+  for (const reel of n.reels) {
+    for (const op of reel.ops) {
+      op.id = opMap.get(op.id);
+      if (op.resourceId && resMap.has(op.resourceId)) op.resourceId = resMap.get(op.resourceId);
+      op.dependsOn = (op.dependsOn || [])
+        .map((d) => opMap.get(d))
+        .filter(Boolean); // 悬空依赖已在校验阶段拦截，这里再兜底
+    }
+  }
+  for (const v of n.versions) v.id = uid("ver");
+}
+
+/**
+ * 执行导入。normalize 阶段已经为全部外部实体重签了本应用生成的安全 id，
+ * 这里只做两件事：
+ *  1) 与当前库同名的资源统一到同一标识，导入工序改挂现有 id（不留未分配）；
+ *  2) 追加卷与版本（版本标识重复已在校验阶段拦截）。
+ * 整批可撤销。
+ */
 function applyImport(normalized) {
   const before = clone(env.doc);
   const imported = clone(normalized);
 
-  // 资源映射：
-  //  - 与现有资源同名 → 视为同一资源，导入工序改挂到现有 id（不新增）
-  //  - id 撞但名字不同 → 重新签发 id 后新增
-  //  - 其余 → 原样新增
-  const resIdMap = new Map();
-  const keptResources = [];
+  // 同名资源 → 现有资源标识
+  const resIdRemap = new Map();
   for (const r of imported.resources) {
     const sameName = env.doc.resources.find((x) => x.name === r.name);
-    if (sameName) {
-      resIdMap.set(r.id, sameName.id);
-    } else if (env.doc.resources.some((x) => x.id === r.id)) {
-      const nid = uid("res");
-      resIdMap.set(r.id, nid);
-      keptResources.push({ ...r, id: nid });
-    } else {
-      keptResources.push(r);
-    }
+    if (sameName) resIdRemap.set(r.id, sameName.id);
   }
-  imported.resources = keptResources;
-
-  const existingReels = new Set(env.doc.reels.map((r) => r.id));
-  const reelIdMap = new Map();
-  const opIdMap = new Map();
-  imported.reels = imported.reels.map((reel) => {
-    let rid = reel.id;
-    if (existingReels.has(rid)) {
-      rid = uid("reel");
-      reelIdMap.set(reel.id, rid);
-    }
-    const ops = reel.ops.map((op) => {
-      const nid = uid("op");
-      opIdMap.set(op.id, nid);
-      return {
-        ...op,
-        reelId: rid,
-        resourceId: resIdMap.get(op.resourceId) || op.resourceId,
-        dependsOn: op.dependsOn.map((d) => opIdMap.get(d) || d) // 先占位，下面统一重写
-      };
-    });
-    return { ...reel, id: rid, ops };
-  });
-  // 依赖重写（卷内）
+  imported.resources = imported.resources.filter((r) => !resIdRemap.has(r.id));
   for (const reel of imported.reels) {
     for (const op of reel.ops) {
-      op.dependsOn = op.dependsOn.map((d) => opIdMap.get(d) || d);
+      if (op.resourceId && resIdRemap.has(op.resourceId)) {
+        op.resourceId = resIdRemap.get(op.resourceId);
+      }
     }
   }
 
   env.doc.resources = mergeResources(env.doc.resources, imported.resources);
   env.doc.reels = env.doc.reels.concat(imported.reels);
-  // 版本：按 label 去重
-  const haveV = new Set(env.doc.versions.map((v) => v.id));
+  const haveLabel = new Set(env.doc.versions.map((v) => v.label));
+  const haveId = new Set(env.doc.versions.map((v) => v.id));
   for (const v of imported.versions) {
-    if (!haveV.has(v.id)) {
-      env.doc.versions.push(v);
-      haveV.add(v.id);
-    }
+    if (haveId.has(v.id) || haveLabel.has(v.label)) continue; // 双保险
+    env.doc.versions.push(v);
+    haveId.add(v.id);
+    haveLabel.add(v.label);
   }
   env.revision += 1;
   persistEnv();
@@ -889,63 +941,188 @@ function threeWayMerge(baseDoc, localDoc, remoteDoc, resolvedSigs) {
   const conflicts = [];
   const autoApplied = [];
   const merged = clone(localDoc);
+  const resolved = resolvedSigs || [];
+  // 实体级冲突涉及的字段路径前缀，字段比对阶段跳过，避免同一改动报两遍
+  const suppressedFieldPrefixes = [];
 
-  const remoteReelIds = new Set(remoteDoc.reels.map((r) => r.id));
+  const jsonEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const priorFor = (sig) => resolved.find((x) => x && x.sig === sig);
+
+  const baseReelById = new Map(baseDoc.reels.map((r) => [r.id, r]));
+  const remoteReelById = new Map(remoteDoc.reels.map((r) => [r.id, r]));
   const localReelIds = new Set(localDoc.reels.map((r) => r.id));
 
-  // —— 卷实体增删 ——
-  for (const rr of remoteDoc.reels) {
-    if (!localReelIds.has(rr.id)) {
-      if (baseDoc.reels.some((b) => b.id === rr.id)) {
-        // 本页删了、对端改了：不能静默删除对端的劳动
-        merged.reels.push(clone(rr));
-        autoApplied.push(`本页删除的卷「${rr.name}」在另一标签页仍有修改，已保留`);
+  function pushEntityConflict(c, reelId, restoreSource) {
+    const withSource = { ...c, _keepSource: restoreSource };
+    const prior = priorFor(c.sig);
+    if (prior) {
+      applyEntityDecision(merged, withSource, prior.value, restoreSource);
+      suppressedFieldPrefixes.push(prior.value === "delete" ? `reel:${reelId}:` : `__none__:${reelId}`);
+      return;
+    }
+    if (restoreSource && !merged.reels.some((r) => r.id === reelId)) {
+      merged.reels.push(clone(restoreSource));
+    }
+    conflicts.push({ id: uid("cf"), entity: true, pick: null, ...withSource,
+      _rawLocal: withSource.localAction, _rawRemote: withSource.remoteAction });
+    suppressedFieldPrefixes.push(`reel:${reelId}:`);
+  }
+
+  /* ---------- 卷实体 ---------- */
+  for (const br of baseDoc.reels) {
+    const inLocal = localReelIds.has(br.id);
+    const inRemote = remoteReelById.has(br.id);
+    const localReel = inLocal ? localDoc.reels.find((r) => r.id === br.id) : null;
+    const remoteReel = inRemote ? remoteReelById.get(br.id) : null;
+    const localChanged = inLocal && !jsonEqual(localReel, br);
+    const remoteChanged = inRemote && !jsonEqual(remoteReel, br);
+
+    if (inLocal && !inRemote) {
+      if (localChanged) {
+        // 本页改了、对端删了 → 实体冲突
+        pushEntityConflict({
+          kind: "reel", sig: `entity:reel:${br.id}`, entityId: br.id,
+          label: `卷「${localReel.name}」`,
+          localAction: "keep", remoteAction: "delete",
+          localText: `保留本页修改过的卷（${localReel.ops.length} 道工序）`,
+          remoteText: "跟随另一标签页删除整卷",
+          _keepSource: localReel
+        }, br.id, localReel);
       } else {
-        merged.reels.push(clone(rr));
-        autoApplied.push(`并入另一标签页新增的卷：${rr.name}`);
+        // 本页未动、对端删除 → 跟随删除，不自行恢复
+        merged.reels = merged.reels.filter((r) => r.id !== br.id);
+        autoApplied.push(`跟随另一标签页删除卷：${br.name}`);
+      }
+    } else if (!inLocal && inRemote && remoteChanged) {
+      // 本页删了、对端改了 → 实体冲突（暂存对端版本供裁决）
+      pushEntityConflict({
+        kind: "reel", sig: `entity:reel:${br.id}`, entityId: br.id,
+        label: `卷「${remoteReel.name}」`,
+        localAction: "delete", remoteAction: "keep",
+        localText: "跟随本页删除整卷",
+        remoteText: `保留另一标签页修改过的卷（${remoteReel.ops.length} 道工序）`,
+        _keepSource: remoteReel
+      }, br.id, remoteReel);
+    }
+  }
+
+  // 对端新增的卷（base 中没有）→ 并入
+  for (const rr of remoteDoc.reels) {
+    if (!baseReelById.has(rr.id) && !localReelIds.has(rr.id)) {
+      merged.reels.push(clone(rr));
+      autoApplied.push(`并入另一标签页新增的卷：${rr.name}`);
+    }
+  }
+
+  /* ---------- 卷内工序实体 ---------- */
+  for (const baseReel of baseDoc.reels) {
+    const remoteReel = remoteReelById.get(baseReel.id);
+    const localReel = localDoc.reels.find((r) => r.id === baseReel.id);
+    const mergedReel = merged.reels.find((r) => r.id === baseReel.id);
+    if (!remoteReel || !localReel || !mergedReel) continue;
+    const baseOps = new Map(baseReel.ops.map((o) => [o.id, o]));
+    const localOps = new Map(localReel.ops.map((o) => [o.id, o]));
+    const remoteOps = new Map(remoteReel.ops.map((o) => [o.id, o]));
+
+    for (const [opId, bop] of baseOps) {
+      const lop = localOps.get(opId);
+      const rop = remoteOps.get(opId);
+      const localChanged = lop && !jsonEqual(lop, bop);
+      const remoteChanged = rop && !jsonEqual(rop, bop);
+
+      if (lop && !rop) {
+        if (localChanged) {
+          const c = {
+            kind: "op", sig: `entity:op:${opId}`,
+            reelId: baseReel.id, entityId: opId,
+            label: `「${localReel.name} · ${lop.kind}」工序`,
+            localAction: "keep", remoteAction: "delete",
+            localText: "保留本页修改过的工序", remoteText: "跟随另一标签页删除该工序",
+            _keepSource: lop
+          };
+          const prior = priorFor(c.sig);
+          if (prior) { applyEntityDecision(merged, c, prior.value, lop); }
+          else conflicts.push({ id: uid("cf"), entity: true, pick: null, ...c,
+            _rawLocal: "keep", _rawRemote: "delete" });
+        } else {
+          mergedReel.ops = mergedReel.ops.filter((o) => o.id !== opId);
+          autoApplied.push(`跟随另一标签页删除工序：${localReel.name} · ${lop.kind}`);
+        }
+        suppressedFieldPrefixes.push(`reel:${baseReel.id}:op:${opId}:`);
+      } else if (!lop && rop && remoteChanged) {
+        const c = {
+          kind: "op", sig: `entity:op:${opId}`,
+          reelId: baseReel.id, entityId: opId,
+          label: `「${localReel.name} · ${rop.kind}」工序`,
+          localAction: "delete", remoteAction: "keep",
+          localText: "跟随本页删除该工序", remoteText: "保留另一标签页修改过的工序",
+          _keepSource: rop
+        };
+        const prior = priorFor(c.sig);
+        if (!mergedReel.ops.some((o) => o.id === opId) && (!prior || prior.value === "keep")) mergedReel.ops.push(clone(rop));
+        if (!prior) {
+          conflicts.push({ id: uid("cf"), entity: true, pick: null, ...c,
+            _rawLocal: "delete", _rawRemote: "keep" });
+        } else {
+          applyEntityDecision(merged, c, prior.value, rop);
+        }
+        suppressedFieldPrefixes.push(`reel:${baseReel.id}:op:${opId}:`);
+      }
+    }
+
+    // 对端新增工序（base 没有、本地也没有）→ 并入
+    for (const rop of remoteReel.ops) {
+      if (!baseOps.has(rop.id) && !localOps.has(rop.id)) {
+        mergedReel.ops.push(clone(rop));
+        autoApplied.push(`并入另一标签页在「${localReel.name}」新增的工序：${rop.kind}`);
       }
     }
   }
-  for (const br of baseDoc.reels) {
-    if (!remoteReelIds.has(br.id) && localReelIds.has(br.id) &&
-        !localDoc.reels.some((l) => l.id === br.id && JSON.stringify(l) === JSON.stringify(br))) {
-      autoApplied.push(`另一标签页删除了卷「${br.name}」，但本页有改动，已保留本页版本`);
+
+  /* ---------- 资源实体 ---------- */
+  const baseResById = new Map(baseDoc.resources.map((r) => [r.id, r]));
+  for (const br of baseDoc.resources) {
+    const lr = localDoc.resources.find((r) => r.id === br.id);
+    const rr = remoteDoc.resources.find((r) => r.id === br.id);
+    const localChanged = lr && !jsonEqual(lr, br);
+    if (lr && !rr) {
+      if (!localChanged) {
+        // 本页未改、对端删除 → 跟随删除
+        merged.resources = merged.resources.filter((x) => x.id !== br.id);
+        for (const reel of merged.reels) for (const op of reel.ops) {
+          if (op.resourceId === br.id) op.resourceId = null;
+        }
+        autoApplied.push(`跟随另一标签页删除资源：${br.name}`);
+        continue;
+      }
+      const c = {
+        kind: "resource", sig: `entity:res:${br.id}`, entityId: br.id,
+        label: `资源「${lr.name}」`,
+        localAction: "keep", remoteAction: "delete",
+        localText: "保留本页修改过的资源",
+        remoteText: "跟随另一标签页删除（引用它的工序将变为未分配，需重新指派）",
+        _keepSource: lr
+      };
+      const prior = priorFor(c.sig);
+      if (prior) {
+        applyEntityDecision(merged, c, prior.value, lr);
+      } else {
+        conflicts.push({ id: uid("cf"), entity: true, pick: null, ...c,
+          _rawLocal: "keep", _rawRemote: "delete" });
+      }
+      suppressedFieldPrefixes.push(`res:${br.id}:`);
     }
   }
-
-  // —— 资源：对端新增并入（同名去重）——
   const localResNames = new Set(merged.resources.map((r) => r.name));
   for (const rr of remoteDoc.resources) {
-    const existsById = merged.resources.some((r) => r.id === rr.id);
-    if (!existsById && !localResNames.has(rr.name)) {
+    if (!baseResById.has(rr.id) && !merged.resources.some((x) => x.id === rr.id) && !localResNames.has(rr.name)) {
       merged.resources.push(clone(rr));
       autoApplied.push(`并入另一标签页新增的资源：${rr.name}`);
       localResNames.add(rr.name);
     }
   }
 
-  // —— 同卷内的工序实体增删 ——
-  for (const rr of remoteDoc.reels) {
-    const localReel = merged.reels.find((r) => r.id === rr.id);
-    if (!localReel) continue;
-    const baseReel = baseDoc.reels.find((b) => b.id === rr.id);
-    const localOpIds = new Set(localReel.ops.map((o) => o.id));
-    for (const rop of rr.ops) {
-      if (!localOpIds.has(rop.id)) {
-        if (!baseReel || !baseReel.ops.some((o) => o.id === rop.id)) {
-          localReel.ops.push(clone(rop));
-          autoApplied.push(`并入另一标签页在「${localReel.name}」新增的工序：${rop.kind}`);
-        }
-        // base 有、本地删、对端改 → 冲突时通过字段路径体现；这里先补回实体，再让字段比对暴露
-        if (baseReel && baseReel.ops.some((o) => o.id === rop.id)) {
-          localReel.ops.push(clone(rop));
-          autoApplied.push(`本页删除的「${localReel.name} · ${rop.kind}」在另一标签页被修改，已恢复供裁决`);
-        }
-      }
-    }
-  }
-
-  // —— 版本并集 ——
+  /* ---------- 版本 / 片段库 ---------- */
   const vIds = new Set(merged.versions.map((v) => v.id));
   for (const v of remoteDoc.versions) {
     if (!vIds.has(v.id)) {
@@ -954,9 +1131,7 @@ function threeWayMerge(baseDoc, localDoc, remoteDoc, resolvedSigs) {
       autoApplied.push(`并入另一标签页锁定的版本 ${v.label}`);
     }
   }
-
-  // —— 片段库并集（按 code 去重，对端更新的备注并入）——
-  const segByCode = new Map(merged.segments.map((s) => [s.code, s]));
+  const segByCode = new Map((merged.segments || []).map((s) => [s.code, s]));
   for (const s of remoteDoc.segments || []) {
     if (!segByCode.has(s.code)) {
       merged.segments.push(clone(s));
@@ -964,14 +1139,15 @@ function threeWayMerge(baseDoc, localDoc, remoteDoc, resolvedSigs) {
     }
   }
 
-  // —— 字段级三方比对 ——
+  /* ---------- 字段级三方比对 ---------- */
   const fb = flattenDoc(baseDoc);
   const fl = flattenDoc(localDoc);
   const fr = flattenDoc(remoteDoc);
   const allPaths = new Set([...fb.keys(), ...fl.keys(), ...fr.keys()]);
-  const resolved = resolvedSigs || [];
+  const isSuppressed = (path) => suppressedFieldPrefixes.some((p) => path.startsWith(p));
 
   for (const path of allPaths) {
+    if (isSuppressed(path)) continue;
     const b = fb.get(path), l = fl.get(path), r = fr.get(path);
     if (l === r) {
       if (l !== undefined) applyLeaf(merged, path, l);
@@ -986,9 +1162,7 @@ function threeWayMerge(baseDoc, localDoc, remoteDoc, resolvedSigs) {
     }
     if (r === b && l !== b) continue; // 仅本页改，merged 已持有
     // 双方都改且不同
-    // 已裁决记录的是「最终值」而非边：两个标签页视角相反，记边会互相翻盘；
-    // 命中最终值即采用，若两边值都不等于裁决值（裁决后又改过）则重新报冲突。
-    const prior = (resolved || []).find((x) => x && x.sig === conflictSig(path));
+    const prior = priorFor(path);
     if (prior && (prior.value === l || prior.value === r)) {
       if (prior.value !== undefined) applyLeaf(merged, path, prior.value);
       continue;
@@ -996,6 +1170,7 @@ function threeWayMerge(baseDoc, localDoc, remoteDoc, resolvedSigs) {
     const info = parsePath(path, merged);
     conflicts.push({
       id: uid("cf"),
+      entity: false,
       sig: conflictSig(path),
       path,
       label: info.label,
@@ -1008,6 +1183,34 @@ function threeWayMerge(baseDoc, localDoc, remoteDoc, resolvedSigs) {
   }
 
   return { merged, conflicts, autoApplied };
+}
+
+/** 应用已裁决的实体决策（keep / delete）到合并结果 */
+function applyEntityDecision(mergedDoc, conflict, value, keepSource = null) {
+  if (conflict.kind === "reel") {
+    if (value === "delete") {
+      mergedDoc.reels = mergedDoc.reels.filter((r) => r.id !== conflict.entityId);
+    } else if (keepSource && !mergedDoc.reels.some((r) => r.id === conflict.entityId)) {
+      mergedDoc.reels.push(clone(keepSource));
+    }
+  } else if (conflict.kind === "op") {
+    const reel = mergedDoc.reels.find((r) => r.id === conflict.reelId);
+    if (!reel) return;
+    if (value === "delete") {
+      reel.ops = reel.ops.filter((o) => o.id !== conflict.entityId);
+    } else if (keepSource && !reel.ops.some((o) => o.id === conflict.entityId)) {
+      reel.ops.push(clone(keepSource));
+    }
+  } else if (conflict.kind === "resource") {
+    if (value === "delete") {
+      mergedDoc.resources = mergedDoc.resources.filter((x) => x.id !== conflict.entityId);
+      for (const reel of mergedDoc.reels) for (const op of reel.ops) {
+        if (op.resourceId === conflict.entityId) op.resourceId = null;
+      }
+    } else if (keepSource && !mergedDoc.resources.some((x) => x.id === conflict.entityId)) {
+      mergedDoc.resources.push(clone(keepSource));
+    }
+  }
 }
 
 function conflictSig(path) {
@@ -1042,7 +1245,15 @@ function onRemoteStorage(event) {
   } catch {
     return;
   }
-  if (!remoteEnv.doc || remoteEnv.revision === env.revision) return;
+  if (!remoteEnv.doc) return;
+  // 不能按修订号相等就跳过：两个标签页可能从同一基线各自写入相同修订号，
+  // 此时仍必须三方合并（或报冲突），不能丢弃对端的优先级等改动。
+  // 仅当文档与已解决记录都与本页完全一致（无新内容）时才跳过。
+  if (remoteEnv.revision === env.revision
+      && JSON.stringify(remoteEnv.doc) === JSON.stringify(env.doc)
+      && JSON.stringify(remoteEnv.resolved || []) === JSON.stringify(env.resolved || [])) {
+    return;
+  }
   receiveRemote(remoteEnv);
 }
 
@@ -1094,9 +1305,23 @@ function resolveConflict(id, pick) {
   const c = pendingConflicts.find((x) => x.id === id);
   if (!c) return;
   c.pick = pick;
-  const raw = pick === "local" ? c._rawLocal : c._rawRemote;
-  if (raw !== undefined) applyLeaf(pendingMerge.merged, c.path, raw);
+  if (c.entity) {
+    // 实体冲突：选择本页/对端 → 对应 keep/delete 动作
+    const action = pick === "local" ? c.localAction : c.remoteAction;
+    applyEntityDecision(pendingMerge.merged, c, action, c._keepSource);
+  } else {
+    const raw = pick === "local" ? c._rawLocal : c._rawRemote;
+    if (raw !== undefined) applyLeaf(pendingMerge.merged, c.path, raw);
+  }
   renderMergeBanner();
+}
+
+function conflictResolutionValue(c) {
+  if (c.entity) {
+    // 记录最终动作（keep/delete），两个标签页视角一致
+    return c.pick === "local" ? c.localAction : c.remoteAction;
+  }
+  return c.pick === "local" ? c._rawLocal : c._rawRemote;
 }
 
 function confirmMerge() {
@@ -1106,11 +1331,7 @@ function confirmMerge() {
     toast(`还有 ${unresolved.length} 处冲突未选择保留哪一边。`, "error");
     return;
   }
-  const newResolved = pendingConflicts.map((c) => ({
-    sig: c.sig,
-    side: c.pick,
-    value: c.pick === "local" ? c._rawLocal : c._rawRemote
-  }));
+  const newResolved = pendingConflicts.map((c) => ({ sig: c.sig, value: conflictResolutionValue(c) }));
   env.doc = pendingMerge.merged;
   env.base = clone(pendingMerge.baseRemote);
   env.resolved = mergeResolved(mergeResolved(env.resolved, pendingMerge.remoteEnv.resolved), newResolved);
@@ -1173,7 +1394,7 @@ function renderResources() {
       <span class="resource-swatch" style="background:${resourceColor(r.id)}"></span>
       <span class="res-name">${escapeHtml(r.name)}</span>
       <span class="res-kind">${escapeHtml(r.kind)}</span>
-      <button type="button" data-del-res="${r.id}" title="删除资源">×</button>
+      <button type="button" data-del-res="${escapeHtml(r.id)}" title="删除资源">×</button>
     </li>
   `).join("") || `<p class="empty">还没有人员或设备。</p>`;
 }
@@ -1223,27 +1444,27 @@ function renderReels() {
         ? issues.map((i) => `<span class="op-status ${i.level === "error" ? issueClass(i.code) : "none"}">${escapeHtml(shortIssue(i))}</span>`).join("<br>")
         : (op.start ? `<span class="op-status ok">已排 ${escapeHtml(fmtClock(op.start))}</span>` : `<span class="op-status none">未排期</span>`);
       return `
-      <tr class="${hasErr ? "row-error" : ""}" data-op-row="${op.id}">
+      <tr class="${hasErr ? "row-error" : ""}" data-op-row="${escapeHtml(op.id)}">
         <td class="op-kind-cell ${KIND_CLASS[op.kind] || ""}">#${idx + 1} ${escapeHtml(op.kind)}</td>
-        <td><input type="number" min="5" step="5" value="${op.duration}" data-op-field="duration" data-op="${op.id}" style="width:76px" /></td>
+        <td><input type="number" min="5" step="5" value="${op.duration}" data-op-field="duration" data-op="${escapeHtml(op.id)}" style="width:76px" /></td>
         <td>
-          <select data-op-field="resourceId" data-op="${op.id}">
+          <select data-op-field="resourceId" data-op="${escapeHtml(op.id)}">
             <option value="">未分配</option>
             ${env.doc.resources.map((r) => `<option value="${r.id}" ${r.id === op.resourceId ? "selected" : ""}>${escapeHtml(r.name)}</option>`).join("")}
           </select>
         </td>
-        <td><input type="datetime-local" step="300" value="${dtLocalValue(op.start)}" data-op-field="start" data-op="${op.id}" /></td>
+        <td><input type="datetime-local" step="300" value="${dtLocalValue(op.start)}" data-op-field="start" data-op="${escapeHtml(op.id)}" /></td>
         <td>
-          <select class="deps-sel" multiple data-op-field="dependsOn" data-op="${op.id}" title="按住 Ctrl 多选前序">${deps}</select>
+          <select class="deps-sel" multiple data-op-field="dependsOn" data-op="${escapeHtml(op.id)}" title="按住 Ctrl 多选前序">${deps}</select>
         </td>
         <td>${status}<div class="op-status none" style="font-weight:400">${end ? `止于 ${escapeHtml(fmtClock(end))}` : ""}</div></td>
-        <td class="op-row-del"><button type="button" class="small danger" data-del-op="${op.id}">删</button></td>
+        <td class="op-row-del"><button type="button" class="small danger" data-del-op="${escapeHtml(op.id)}">删</button></td>
       </tr>`;
     }).join("");
 
     const addRow = `
       <tr class="add-op-row"><td colspan="7">
-        <form class="add-op-form" data-add-op="${reel.id}">
+        <form class="add-op-form" data-add-op="${escapeHtml(reel.id)}">
           <select name="kind">${OP_KINDS.map((k) => `<option>${k}</option>`).join("")}</select>
           <select name="resourceId"><option value="">未分配资源</option>${optsRes}</select>
           <input name="duration" type="number" min="5" step="5" value="30" title="时长（分）" style="width:80px" />
@@ -1252,22 +1473,22 @@ function renderReels() {
       </td></tr>`;
 
     return `
-    <article class="reel-card p${reel.priority}" data-reel="${reel.id}">
+    <article class="reel-card p${reel.priority}" data-reel="${escapeHtml(reel.id)}">
       <div class="reel-head">
         <label class="field-name">卷名
-          <input class="reel-title-input" value="${escapeHtml(reel.name)}" data-reel-field="name" data-reel="${reel.id}" />
+          <input class="reel-title-input" value="${escapeHtml(reel.name)}" data-reel-field="name" data-reel="${escapeHtml(reel.id)}" />
         </label>
         <label class="field-narrow">优先级
-          <select data-reel-field="priority" data-reel="${reel.id}">
+          <select data-reel-field="priority" data-reel="${escapeHtml(reel.id)}">
             ${PRIORITIES.map((p) => `<option value="${p.value}" ${Number(reel.priority) === p.value ? "selected" : ""}>${p.label}</option>`).join("")}
           </select>
         </label>
         <label class="field">截止时间
-          <input type="datetime-local" step="300" class="${reelLevelErrors.some((e) => e.code === "BAD_DEADLINE") ? "reel-deadline-late" : ""}" value="${dtLocalValue(reel.deadline)}" data-reel-field="deadline" data-reel="${reel.id}" />
+          <input type="datetime-local" step="300" class="${reelLevelErrors.some((e) => e.code === "BAD_DEADLINE") ? "reel-deadline-late" : ""}" value="${dtLocalValue(reel.deadline)}" data-reel-field="deadline" data-reel="${escapeHtml(reel.id)}" />
         </label>
         <span class="priority-badge p${reel.priority}">${PRIORITIES.find((p) => p.value === Number(reel.priority))?.label || ""}优先</span>
         <span class="op-status none" style="font-weight:600">关联片段：${escapeHtml((reel.segmentCodes || []).join("、") || "无")}</span>
-        <button type="button" class="small danger" data-del-reel="${reel.id}">删除整卷</button>
+        <button type="button" class="small danger" data-del-reel="${escapeHtml(reel.id)}">删除整卷</button>
       </div>
       <table class="ops-table">
         <thead><tr>
@@ -1420,8 +1641,8 @@ function renderVersions() {
       <div class="vc-top"><strong>${escapeHtml(v.label)}</strong><time>${escapeHtml(fmtClock(v.lockedAt))}</time></div>
       <p class="vc-note">${escapeHtml(v.note || "（无备注）")} · ${v.reels.length} 卷</p>
       <div class="vc-actions">
-        <button class="small" data-ver-diff="${v.id}">查看差异</button>
-        <button class="small" data-ver-export="${v.id}">导出此版本</button>
+        <button class="small" data-ver-diff="${escapeHtml(v.id)}">查看差异</button>
+        <button class="small" data-ver-export="${escapeHtml(v.id)}">导出此版本</button>
       </div>
     </div>`).join("") || `<p class="empty">尚无锁定版本。校验通过后可锁定快照。</p>`;
 }
@@ -1452,19 +1673,24 @@ function renderMergeBanner() {
     return;
   }
   els.mergeBanner.hidden = false;
+  const entityN = pendingConflicts.filter((c) => c.entity).length;
+  const fieldN = pendingConflicts.length - entityN;
+  const kinds = [];
+  if (fieldN) kinds.push(`${fieldN} 处字段冲突`);
+  if (entityN) kinds.push(`${entityN} 处删除/保留冲突`);
   els.mergeBanner.innerHTML = `
-    <h3>⚠ 双标签页并发修改：${pendingConflicts.length} 处字段冲突，需要裁决（不会静默覆盖任何一边）</h3>
+    <h3>⚠ 双标签页并发修改：${kinds.join("、")}，需要裁决（不会静默覆盖任何一边）</h3>
     <p class="empty" style="color:var(--ink);font-size:13px;margin-bottom:10px">
-      另一标签页与本页修改了相同字段。请逐条选择保留「本页」还是「另一页」的值；非冲突改动（新增卷、资源、锁版）已自动并入。
+      双方修改了相同字段，或一方删除了另一方仍在修改的卷/工序/资源。请逐条选择保留「本页」还是「另一页」的结果；非冲突改动（新增卷、资源、锁版）已自动并入。
     </p>
     ${pendingConflicts.map((c) => `
       <div class="conflict-row">
-        <div><strong>${escapeHtml(c.label)}</strong></div>
+        <div><strong>${escapeHtml(c.label)}${c.entity ? ' <span class="ent-tag">实体删除</span>' : ""}</strong></div>
         <div class="cf-choices">
-          <button type="button" class="conflict-val ${c.pick === "local" ? "chosen" : ""}" data-pick="${c.id}|local">
+          <button type="button" class="conflict-val ${c.pick === "local" ? "chosen" : ""}" data-pick="${escapeHtml(c.id)}|local">
             <b class="cv-tag-local">本页修改</b><span>${escapeHtml(c.localText)}</span>
           </button>
-          <button type="button" class="conflict-val ${c.pick === "remote" ? "chosen" : ""}" data-pick="${c.id}|remote">
+          <button type="button" class="conflict-val ${c.pick === "remote" ? "chosen" : ""}" data-pick="${escapeHtml(c.id)}|remote">
             <b class="cv-tag-remote">另一标签页</b><span>${escapeHtml(c.remoteText)}</span>
           </button>
         </div>
@@ -1594,7 +1820,7 @@ function exportOneVersion(versionId) {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
-  link.download = `film-schedule-${v.label}.json`;
+  link.download = `film-schedule-${safeFilePart(v.label)}.json`;
   link.click();
   URL.revokeObjectURL(link.href);
   toast(`已导出锁定版本 ${v.label}。`, "success");
