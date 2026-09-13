@@ -722,9 +722,10 @@ function validateImport(raw) {
   if (dupCount) warnings.push({ message: `检测到 ${dupCount} 个与当前排期重复的 ID，导入时将重新编号以避免覆盖。` });
 
   const versions = Array.isArray(src.lockedVersions ?? src.versions) ? (src.lockedVersions ?? src.versions) : [];
-  const seenVerIds = new Set(env.doc.versions.map((v) => v.id));
-  const existingLabels = new Set(env.doc.versions.map((v) => v.label));
-  const labelsInFile = new Set();
+  const currentVerIds = new Set(env.doc.versions.map((v) => v.id));
+  const currentVerLabels = new Set(env.doc.versions.map((v) => v.label));
+  const fileVerIds = new Set();    // 本文件内已出现的内部 id
+  const fileVerLabels = new Set(); // 本文件内已出现的可见标识
   for (const v of versions) {
     if (!v || !v.id || !v.label || !Array.isArray(v.reels)) {
       warnings.push({ message: "跳过了一个结构不完整的锁定版本。" });
@@ -736,17 +737,40 @@ function validateImport(raw) {
       errors.push({ message: `锁定版本标识「${rawLabel.slice(0, 20)}」含非法字符或过长，导入被阻止。` });
       continue;
     }
-    if (seenVerIds.has(v.id)) {
-      warnings.push({ message: `已存在相同的锁定版本（id ${v.id.slice(-6)}），跳过。` });
+
+    // id 与可见标识分别检查：四种重复都必须阻断，绝不 warning 后静默丢一份或覆盖
+    const idDupCurrent = currentVerIds.has(v.id);
+    const idDupFile = fileVerIds.has(v.id);
+    const labelDupCurrent = currentVerLabels.has(rawLabel);
+    const labelDupFile = fileVerLabels.has(rawLabel);
+    const idDup = idDupCurrent || idDupFile;
+    const labelDup = labelDupCurrent || labelDupFile;
+    const joinWhere = (...parts) => parts.filter(Boolean).join("、");
+
+    if (idDup && labelDup) {
+      errors.push({
+        message: `锁定版本完全重复：内部 id 与可见标识「${rawLabel}」均已存在（${joinWhere(
+          idDupCurrent && "与当前库", idDupFile && "文件内重复 id",
+          labelDupCurrent && "与当前库同标识", labelDupFile && "文件内同标识")}），拒绝静默丢弃或覆盖，导入被阻止。`
+      });
       continue;
     }
-    if (existingLabels.has(rawLabel) || labelsInFile.has(rawLabel)) {
-      // 版本号重复会破坏「v1/v2」语义与差异对照，必须拦截而不是静默覆盖
-      errors.push({ message: `锁定版本标识重复：${rawLabel}（与当前库或文件内另一版本相同）。` });
+    if (idDup) {
+      // 仅内部 id 重复（标识不同）：两份记录声称同一不可变快照身份，也不能覆盖
+      errors.push({
+        message: `锁定版本内部 id 重复（${joinWhere(idDupCurrent && "与当前库", idDupFile && "文件内")}）：标识「${rawLabel}」与已有版本不同，拒绝覆盖已有版本，导入被阻止。`
+      });
       continue;
     }
-    labelsInFile.add(rawLabel);
-    seenVerIds.add(v.id);
+    if (labelDup) {
+      errors.push({
+        message: `锁定版本可见标识重复：「${rawLabel}」（${joinWhere(labelDupCurrent && "与当前库", labelDupFile && "文件内")}），同一版本号不允许两份记录，导入被阻止。`
+      });
+      continue;
+    }
+
+    fileVerIds.add(v.id);
+    fileVerLabels.add(rawLabel);
     normalized.versions.push({
       ...v,
       label: rawLabel,
